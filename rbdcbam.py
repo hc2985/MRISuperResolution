@@ -77,7 +77,7 @@ class SpatialAttention3D(nn.Module):
         return x * att
 
 class CBAM(nn.Module):
-    def __init__(self, channels, reduction=16, kernel_size=7):
+    def __init__(self, channels, reduction=16, kernel_size=3):
         super(CBAM, self).__init__()
         self.channel_att = ChannelAttention3D(channels, reduction)
         self.spatial_att = SpatialAttention3D(kernel_size)
@@ -96,13 +96,15 @@ class Generator(nn.Module):
         self.conv1 = nn.Conv3d(1, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv3d(64, 1, kernel_size=3, padding=1)
         self.RDB1 = RDB(64, 3, 16)
-        self.cbam = CBAM(64)
+        self.cbam = CBAM(64, kernel_size=3)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         # x: (batch, 1, 40, 112, 138)
         x = self.relu(self.conv1(x))  # (batch, 64, 40, 112, 138)
         x = self.RDB1(x)  # (batch, 64, 40, 112, 138)
+
+        x = self.cbam(x)  # (batch, 64, 40, 112, 138)
 
         # Upsample depth: 40 → 200
         x = F.interpolate(x, size=(200, 112, 138), mode='trilinear', align_corners=False)
@@ -114,7 +116,7 @@ class Generator(nn.Module):
         x = x.reshape(b, d, c, 179, 221).permute(0, 2, 1, 3, 4)
 
         # CBAM: channel attention → spatial attention
-        x = self.cbam(x)  # (batch, 64, 200, 179, 221)
+        #x = self.cbam(x)  # (batch, 64, 200, 179, 221)
 
         x = torch.tanh(self.conv2(x))  # (batch, 1, 200, 179, 221)
         return x
