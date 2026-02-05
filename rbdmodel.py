@@ -51,7 +51,7 @@ class Generator(nn.Module):
         # Output: (batch, 1, 200, 179, 221)
         self.conv1 = nn.Conv3d(1, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv3d(64, 1, kernel_size=3, padding=1)
-        self.RDB1 = RDB(64, 6, 32)
+        self.RDB1 = RDB(64, 3, 16)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
@@ -96,25 +96,53 @@ class Discriminator(nn.Module):
 # =====================
 
 def ssim_loss(pred, target):
+    """Per-slice SSIM with independent normalization to match evaluation metric."""
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
 
-    mu1 = pred.mean()
-    mu2 = target.mean()
+    # pred/target: (batch, 1, D, H, W) → flatten slices to (B*D, H*W)
+    b, c, d, h, w = pred.shape
+    p = pred.squeeze(1).reshape(b * d, h * w)
+    t = target.squeeze(1).reshape(b * d, h * w)
 
-    sigma1_sq = ((pred - mu1) ** 2).mean()
-    sigma2_sq = ((target - mu2) ** 2).mean()
-    sigma12 = ((pred - mu1) * (target - mu2)).mean()
+    # Normalize each slice independently to [0, 1]
+    p_min = p.min(dim=1, keepdim=True)[0]
+    p_max = p.max(dim=1, keepdim=True)[0]
+    t_min = t.min(dim=1, keepdim=True)[0]
+    t_max = t.max(dim=1, keepdim=True)[0]
+    p = (p - p_min) / (p_max - p_min + 1e-8)
+    t = (t - t_min) / (t_max - t_min + 1e-8)
+
+    # Per-slice SSIM
+    mu1 = p.mean(dim=1)
+    mu2 = t.mean(dim=1)
+    sigma1_sq = ((p - mu1.unsqueeze(1)) ** 2).mean(dim=1)
+    sigma2_sq = ((t - mu2.unsqueeze(1)) ** 2).mean(dim=1)
+    sigma12 = ((p - mu1.unsqueeze(1)) * (t - mu2.unsqueeze(1))).mean(dim=1)
 
     ssim = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
            ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
-    return ssim
+    return ssim.mean()
 
 
 def psnr_loss(pred, target):
-    mse = ((pred - target) ** 2).mean()
+    """Per-slice PSNR with independent normalization to match evaluation metric."""
+    b, c, d, h, w = pred.shape
+    p = pred.squeeze(1).reshape(b * d, h * w)
+    t = target.squeeze(1).reshape(b * d, h * w)
+
+    # Normalize each slice independently to [0, 1]
+    p_min = p.min(dim=1, keepdim=True)[0]
+    p_max = p.max(dim=1, keepdim=True)[0]
+    t_min = t.min(dim=1, keepdim=True)[0]
+    t_max = t.max(dim=1, keepdim=True)[0]
+    p = (p - p_min) / (p_max - p_min + 1e-8)
+    t = (t - t_min) / (t_max - t_min + 1e-8)
+
+    mse = ((p - t) ** 2).mean(dim=1)
     psnr = 10 * torch.log10(1.0 / (mse + 1e-8))
-    return torch.clamp(psnr, 0, 50)
+    psnr = torch.clamp(psnr, 0, 50)
+    return psnr.mean()
 
 
 # Loss functions
