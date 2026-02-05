@@ -1,5 +1,5 @@
 from extract_slices import load_nifti, create_submission_df
-from rbdmodel import Generator, Discriminator, generator_loss, discriminator_loss
+from rbdcbam import Generator, Discriminator, generator_loss, discriminator_loss
 import torch
 import torch.optim as optim
 import numpy as np
