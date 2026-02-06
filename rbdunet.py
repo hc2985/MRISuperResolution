@@ -19,9 +19,6 @@ latent_dim = 100
 channels = 1 # suggested default : 1, number of image channels (gray scale)
 img_shape = (channels, 112, 138) # (Channels, Image Size(H), Image Size(W))
 
-
-## RBD ##
-
 class make_dense(nn.Module):
     def __init__(self, nChannels, growthRate, kernel_size=3):
         super(make_dense, self).__init__()
@@ -47,47 +44,6 @@ class RDB(nn.Module):
         out = out + x
         return out
 
-## CBAM ##
-
-class ChannelAttention3D(nn.Module):
-    def __init__(self, channels, reduction=16):
-        super(ChannelAttention3D, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(),
-            nn.Linear(channels // reduction, channels, bias=False)
-        )
-
-    def forward(self, x):
-        b, c, d, h, w = x.shape
-        avg = F.adaptive_avg_pool3d(x, 1).view(b, c)
-        mx = F.adaptive_max_pool3d(x, 1).view(b, c)
-        att = torch.sigmoid(self.fc(avg) + self.fc(mx))
-        return x * att.view(b, c, 1, 1, 1)
-
-class SpatialAttention3D(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention3D, self).__init__()
-        self.conv = nn.Conv3d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
-
-    def forward(self, x):
-        avg = x.mean(dim=1, keepdim=True)
-        mx = x.max(dim=1, keepdim=True)[0]
-        att = torch.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
-        return x * att
-
-class CBAM(nn.Module):
-    def __init__(self, channels, reduction=16, kernel_size=3):
-        super(CBAM, self).__init__()
-        self.channel_att = ChannelAttention3D(channels, reduction)
-        self.spatial_att = SpatialAttention3D(kernel_size)
-
-    def forward(self, x):
-        x = self.channel_att(x)
-        x = self.spatial_att(x)
-        return x
-    
-## Actual Generator ##
 class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
@@ -96,15 +52,12 @@ class Generator(nn.Module):
         self.conv1 = nn.Conv3d(1, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv3d(64, 1, kernel_size=3, padding=1)
         self.RDB1 = RDB(64, 3, 16)
-        self.cbam = CBAM(64, kernel_size=3)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         # x: (batch, 1, 40, 112, 138)
         x = self.relu(self.conv1(x))  # (batch, 64, 40, 112, 138)
         x = self.RDB1(x)  # (batch, 64, 40, 112, 138)
-
-        #x = self.cbam(x)  # (batch, 64, 40, 112, 138)
 
         # Upsample depth: 40 → 200
         x = F.interpolate(x, size=(200, 112, 138), mode='trilinear', align_corners=False)
@@ -115,30 +68,55 @@ class Generator(nn.Module):
         x = F.interpolate(x, size=(179, 221), mode='bicubic', align_corners=False)
         x = x.reshape(b, d, c, 179, 221).permute(0, 2, 1, 3, 4)
 
-        # CBAM: channel attention → spatial attention
-        x = self.cbam(x)  # (batch, 64, 200, 179, 221)
-
         x = torch.tanh(self.conv2(x))  # (batch, 1, 200, 179, 221)
         return x
 
 class Discriminator(nn.Module):
     def __init__(self):
         super(Discriminator, self).__init__()
-        # Input: (batch, 1, 200, 179, 221)
-        # Output: (batch, 1, 25, 23, 28) — per-patch real/fake
-
-        self.model = nn.Sequential(
-            # (1, 200, 179, 221) → (64, 100, 90, 111)
-            nn.Conv3d(1, 64, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            # (64, 100, 90, 111) → (1, 50, 45, 56)
-            nn.Conv3d(64, 1, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid()
-        )
+        # 2D U-Net discriminator operating per-slice
+        # Encoder
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(1, 16, 4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True))
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(16, 32, 4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2, inplace=True))
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True))
+        # Decoder with skip connections
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(64 + 32, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2, inplace=True))
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(32 + 16, 16, 3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.LeakyReLU(0.2, inplace=True))
+        self.out = nn.Sequential(
+            nn.Conv2d(16, 1, 3, padding=1),
+            nn.Sigmoid())
 
     def forward(self, x):
-        return self.model(x)  # (batch, 1, 50, 45, 56)
+        # x: (batch, 1, D, H, W) → per-slice 2D
+        b, c, d, h, w = x.shape
+        x = x.squeeze(1).reshape(b * d, 1, h, w)
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        # Decoder
+        d2 = F.interpolate(e3, size=e2.shape[2:], mode='bilinear', align_corners=False)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = F.interpolate(d2, size=e1.shape[2:], mode='bilinear', align_corners=False)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        out = self.out(d1)
+        # Reshape back to 3D
+        out = out.reshape(b, d, 1, out.shape[2], out.shape[3]).permute(0, 2, 1, 3, 4)
+        return out
 
 
 # =====================
@@ -228,3 +206,4 @@ def discriminator_loss(discriminator, fake, real):
     return (loss_real + loss_fake) / 2
 
 #Epoch [50/50] G_loss: 43.7042 D_loss: 0.5519 to beat
+#Epoch [100/100] G_loss: 42.3399 D_loss: 0.5915 to beat

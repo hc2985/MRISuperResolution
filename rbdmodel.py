@@ -178,3 +178,4 @@ def discriminator_loss(discriminator, fake, real):
     return (loss_real + loss_fake) / 2
 
 #Epoch [50/50] G_loss: 43.7042 D_loss: 0.5519 to beat
+#Epoch [100/100] G_loss: 42.3399 D_loss: 0.5915 to beat
