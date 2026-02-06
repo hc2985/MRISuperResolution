@@ -45,13 +45,13 @@ discriminator = Discriminator().to(device)
 
 lr = 0.0002
 g_optimizer = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
-d_optimizer = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+d_optimizer = optim.Adam(discriminator.parameters(), lr=0.00005, betas=(0.5, 0.999))
 
 # =====================
 # Training Loop
 # =====================
 
-num_epochs = 50
+num_epochs = 150
 
 for epoch in range(num_epochs):
     g_losses = []

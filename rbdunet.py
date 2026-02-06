@@ -51,7 +51,7 @@ class Generator(nn.Module):
         # Output: (batch, 1, 200, 179, 221)
         self.conv1 = nn.Conv3d(1, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv3d(64, 1, kernel_size=3, padding=1)
-        self.RDB1 = RDB(64, 3, 16)
+        self.RDB1 = RDB(64, 5, 16)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
@@ -77,27 +77,27 @@ class Discriminator(nn.Module):
         # 2D U-Net discriminator operating per-slice
         # Encoder
         self.enc1 = nn.Sequential(
-            nn.Conv2d(1, 16, 4, stride=2, padding=1),
+            nn.Conv2d(1, 8, 4, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True))
         self.enc2 = nn.Sequential(
+            nn.Conv2d(8, 16, 4, stride=2, padding=1),
+            nn.BatchNorm2d(16),
+            nn.LeakyReLU(0.2, inplace=True))
+        self.enc3 = nn.Sequential(
             nn.Conv2d(16, 32, 4, stride=2, padding=1),
             nn.BatchNorm2d(32),
             nn.LeakyReLU(0.2, inplace=True))
-        self.enc3 = nn.Sequential(
-            nn.Conv2d(32, 64, 4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True))
         # Decoder with skip connections
         self.dec2 = nn.Sequential(
-            nn.Conv2d(64 + 32, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True))
-        self.dec1 = nn.Sequential(
             nn.Conv2d(32 + 16, 16, 3, padding=1),
             nn.BatchNorm2d(16),
             nn.LeakyReLU(0.2, inplace=True))
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(16 + 8, 8, 3, padding=1),
+            nn.BatchNorm2d(8),
+            nn.LeakyReLU(0.2, inplace=True))
         self.out = nn.Sequential(
-            nn.Conv2d(16, 1, 3, padding=1),
+            nn.Conv2d(8, 1, 3, padding=1),
             nn.Sigmoid())
 
     def forward(self, x):
