@@ -44,6 +44,46 @@ class RDB(nn.Module):
         out = out + x
         return out
 
+## CBAM ##
+
+class ChannelAttention3D(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(ChannelAttention3D, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels, bias=False)
+        )
+
+    def forward(self, x):
+        b, c, d, h, w = x.shape
+        avg = F.adaptive_avg_pool3d(x, 1).view(b, c)
+        mx = F.adaptive_max_pool3d(x, 1).view(b, c)
+        att = torch.sigmoid(self.fc(avg) + self.fc(mx))
+        return x * att.view(b, c, 1, 1, 1)
+
+class SpatialAttention3D(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention3D, self).__init__()
+        self.conv = nn.Conv3d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
+
+    def forward(self, x):
+        avg = x.mean(dim=1, keepdim=True)
+        mx = x.max(dim=1, keepdim=True)[0]
+        att = torch.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+        return x * att
+
+class CBAM(nn.Module):
+    def __init__(self, channels, reduction=16, kernel_size=3):
+        super(CBAM, self).__init__()
+        self.channel_att = ChannelAttention3D(channels, reduction)
+        self.spatial_att = SpatialAttention3D(kernel_size)
+
+    def forward(self, x):
+        x = self.channel_att(x)
+        x = self.spatial_att(x)
+        return x
+    
 class Generator(nn.Module):
     def __init__(self):
         super(Generator, self).__init__()
@@ -52,6 +92,7 @@ class Generator(nn.Module):
         self.conv1 = nn.Conv3d(1, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv3d(64, 1, kernel_size=3, padding=1)
         self.RDB1 = RDB(64, 4, 16)
+        self.cbam = CBAM(64, reduction=8, kernel_size=3)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
@@ -61,12 +102,14 @@ class Generator(nn.Module):
 
         # Upsample depth: 40 → 200
         x = F.interpolate(x, size=(200, 112, 138), mode='trilinear', align_corners=False)
-
+    
         # Upsample spatial with bicubic: 112×138 → 179×221
         b, c, d, h, w = x.shape
         x = x.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)
         x = F.interpolate(x, size=(179, 221), mode='bicubic', align_corners=False)
         x = x.reshape(b, d, c, 179, 221).permute(0, 2, 1, 3, 4)
+
+        x = self.cbam(x)
 
         x = torch.tanh(self.conv2(x))  # (batch, 1, 200, 179, 221)
         return x
