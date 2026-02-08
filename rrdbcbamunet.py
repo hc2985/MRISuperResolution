@@ -43,6 +43,20 @@ class RDB(nn.Module):
         out = self.conv_1x1(out)    
         out = out + x
         return out
+    
+class RRDB(nn.Module):
+    '''Residual in Residual Dense Block'''
+    def __init__(self, nChannels, nDenselayer, growthRate):
+        super(RRDB, self).__init__()
+        self.RDB1 = RDB(nChannels, nDenselayer, growthRate)
+        self.RDB2 = RDB(nChannels, nDenselayer, growthRate)
+        self.RDB3 = RDB(nChannels, nDenselayer, growthRate)
+
+    def forward(self, x):
+        out = self.RDB1(x)
+        out = self.RDB2(out)
+        out = self.RDB3(out)
+        return out * 0.2 + x
 
 ## CBAM ##
 
@@ -91,26 +105,22 @@ class Generator(nn.Module):
         # Output: (batch, 1, 200, 179, 221)
         self.conv1 = nn.Conv3d(1, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv3d(64, 1, kernel_size=3, padding=1)
-        self.RDB1 = RDB(64, 4, 16)
+        self.RRDB1 = RRDB(64, 3, 16)
         self.cbam = CBAM(64, reduction=8, kernel_size=3)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         # x: (batch, 1, 40, 112, 138)
         x = self.relu(self.conv1(x))  # (batch, 64, 40, 112, 138)
-        x = self.RDB1(x)  # (batch, 64, 40, 112, 138)
-
+        x = self.RRDB1(x)  # (batch, 64, 40, 112, 138)
         # Upsample depth: 40 → 200
         x = F.interpolate(x, size=(200, 112, 138), mode='trilinear', align_corners=False)
-    
         # Upsample spatial with bicubic: 112×138 → 179×221
         b, c, d, h, w = x.shape
         x = x.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)
         x = F.interpolate(x, size=(179, 221), mode='bicubic', align_corners=False)
         x = x.reshape(b, d, c, 179, 221).permute(0, 2, 1, 3, 4)
-
         x = self.cbam(x)
-
         x = torch.tanh(self.conv2(x))  # (batch, 1, 200, 179, 221)
         return x
 
@@ -120,27 +130,27 @@ class Discriminator(nn.Module):
         # 2D U-Net discriminator operating per-slice
         # Encoder
         self.enc1 = nn.Sequential(
-            nn.Conv2d(1, 8, 4, stride=2, padding=1),
+            nn.Conv2d(1, 16, 4, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True))
         self.enc2 = nn.Sequential(
-            nn.Conv2d(8, 16, 4, stride=2, padding=1),
-            nn.BatchNorm2d(16),
-            nn.LeakyReLU(0.2, inplace=True))
-        self.enc3 = nn.Sequential(
             nn.Conv2d(16, 32, 4, stride=2, padding=1),
             nn.BatchNorm2d(32),
             nn.LeakyReLU(0.2, inplace=True))
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True))
         # Decoder with skip connections
         self.dec2 = nn.Sequential(
+            nn.Conv2d(64 + 32, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2, inplace=True))
+        self.dec1 = nn.Sequential(
             nn.Conv2d(32 + 16, 16, 3, padding=1),
             nn.BatchNorm2d(16),
             nn.LeakyReLU(0.2, inplace=True))
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(16 + 8, 8, 3, padding=1),
-            nn.BatchNorm2d(8),
-            nn.LeakyReLU(0.2, inplace=True))
         self.out = nn.Sequential(
-            nn.Conv2d(8, 1, 3, padding=1),
+            nn.Conv2d(16, 1, 3, padding=1),
             nn.Sigmoid())
 
     def forward(self, x):
@@ -232,7 +242,7 @@ def generator_loss(discriminator, fake, real):
     competition_score = 0.5 * ssim + 0.5 * (psnr / 50)
 
     # Maximize competition_score = minimize (1 - competition_score)
-    return g_adv + 50 * (1 - competition_score) #100 for current best
+    return g_adv + 40 * (1 - competition_score) 
 
 
 def discriminator_loss(discriminator, fake, real):
