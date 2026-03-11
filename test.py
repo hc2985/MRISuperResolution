@@ -1,9 +1,8 @@
 from extract_slices import load_nifti, create_submission_df
-from rbdunet import Generator, Discriminator, generator_loss, discriminator_loss
+from rrdbunetpatch import Generator, generator_loss
 import torch
 import torch.optim as optim
 import numpy as np
-import pandas as pd
 import os
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -41,11 +40,9 @@ print(f"Loaded {len(train_pairs)} training pairs")
 # Initialize Models
 # ===================== 
 generator = Generator().to(device)
-discriminator = Discriminator().to(device)
 
-lr = 0.0002
-g_optimizer = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
-d_optimizer = optim.Adam(discriminator.parameters(), lr=0.00003, betas=(0.5, 0.999))
+lr = 0.0002847640275877081
+g_optimizer = optim.Adam(generator.parameters(), lr=lr, betas=(0.6158912697929406, 0.999))
 
 # =====================
 # Training Loop
@@ -64,25 +61,17 @@ for epoch in range(num_epochs):
         # Generate fake high-field
         fake = generator(low_field)
 
-        # --- Train Discriminator ---
-        d_optimizer.zero_grad()
-        d_loss = discriminator_loss(discriminator, fake, high_field)
-        d_loss.backward()
-        d_optimizer.step()
-
         # --- Train Generator ---
         g_optimizer.zero_grad()
-        fake = generator(low_field)  # regenerate after discriminator update
-        g_loss = generator_loss(discriminator, fake, high_field)
+        fake = generator(low_field) 
+        g_loss = generator_loss(fake, high_field)
         g_loss.backward()
         g_optimizer.step()
 
         g_losses.append(g_loss.item())
-        d_losses.append(d_loss.item())
 
     avg_g = np.mean(g_losses)
-    avg_d = np.mean(d_losses)
-    print(f"Epoch [{epoch+1}/{num_epochs}] G_loss: {avg_g:.4f} D_loss: {avg_d:.4f}")
+    print(f"Epoch [{epoch+1}/{num_epochs}] G_loss: {avg_g:.4f}")
 
 print("Training complete")
 
