@@ -1,5 +1,5 @@
 from extract_slices import load_nifti, slice_to_base64, base64_to_slice
-from metric import compute_psnr, compute_ssim, score
+from metric import compute_ms_ssim, score
 
 import numpy as np
 import torchvision.transforms as transforms
@@ -10,12 +10,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 
+
 input_dim = (112, 138)
 output_dim = (179, 221)
 input_layer = 40
 output_layer = 200
-
-latent_dim = 100
 channels = 1 # suggested default : 1, number of image channels (gray scale)
 img_shape = (channels, 112, 138) # (Channels, Image Size(H), Image Size(W))
 
@@ -110,25 +109,24 @@ class Unet3D(nn.Module):
             nn.Conv3d(in_ch, base_ch, kernel_size=3, padding=1, bias=False),
             nn.ReLU(inplace=True)
         )
-        self.RRDB_inc = RRDB(base_ch, 3, 16)
+        self.RRDB_inc = RRDB(base_ch, 2, 16)
         self.down1 = nn.Sequential(
             nn.Conv3d(base_ch, base_ch * 2, kernel_size=3, padding=1, bias=False),
             nn.ReLU(inplace=True)
         )
-        self.RRDB_down1 = RRDB(base_ch * 2, 3, 16)
+        self.RRDB_down1 = RRDB(base_ch * 2, 2, 16)
         self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
         self.bridge = nn.Sequential(
             nn.Conv3d(base_ch * 2, base_ch * 2, kernel_size=3, padding=1, bias=False),
             nn.ReLU(inplace=True)
         )
-        self.RRDB_bridge = RRDB(base_ch * 2, 3, 16)
+        self.RRDB_bridge = RRDB(base_ch * 2, 2, 16)
         self.upconv1 = nn.ConvTranspose3d(base_ch * 2, base_ch, kernel_size=2, stride=2, bias=False)
         self.up1 = nn.Sequential(
-            nn.Conv3d(base_ch * 2, base_ch, kernel_size=3, padding=1, bias=False),
+            nn.Conv3d(base_ch * 3, base_ch, kernel_size=3, padding=1, bias=False),
             nn.ReLU(inplace=True)
         )
-        self.RRDB_up = RRDB(base_ch, 3, 16)
-        self.RRDB1 = RRDB(base_ch, 3, 16)
+        self.RRDB_up = RRDB(base_ch, 2, 16)
 
     def forward(self, x):
         # x: (B, 1, D, H, W)
@@ -156,31 +154,17 @@ class Unet3D(nn.Module):
         return xout
     
 class Generator(nn.Module):
-    def __init__(self, mode='rrdb'):
+    def __init__(self):
         super(Generator, self).__init__()
         # Input: (batch, 1, 40, 112, 138)
         # Output: (batch, 1, 200, 179, 221)
-        # mode: 'rrdb' (default) uses the existing RRDB pipeline
-        #       'unet'         uses a lightweight 3D U-Net backbone
-        self.mode = mode
-        # keep conv1 for RRDB path compatibility
-        self.conv1 = nn.Conv3d(1, 64, kernel_size=3, padding=1)
-        self.RRDB1 = RRDB(64, 3, 16)
-        # U-Net path
-        if self.mode == 'unet':
-            self.unet = Unet3D(in_ch=1, base_ch=64)
-
-        self.cbam = CBAM(64, reduction=8, kernel_size=3)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv3d(64, 1, kernel_size=3, padding=1)
+        self.unet = Unet3D(in_ch=1, base_ch=48)
+        self.cbam = CBAM(48, reduction=8, kernel_size=3)
+        self.conv2 = nn.Conv3d(48, 1, kernel_size=3, padding=1)
 
     def forward(self, x):
         # x: (batch, 1, 40, 112, 138)
-        if self.mode == 'unet':
-            x = self.unet(x)               # (batch, 64, 40, 112, 138)
-        else:
-            x = self.relu(self.conv1(x))  # (batch, 64, 40, 112, 138)
-            x = self.RRDB1(x)             # (batch, 64, 40, 112, 138)
+        x = self.unet(x)               # (batch, 48, 40, 112, 138)
 
         # Upsample depth: 40 → 200
         x = F.interpolate(x, size=(200, 112, 138), mode='trilinear', align_corners=False)
@@ -193,123 +177,91 @@ class Generator(nn.Module):
         x = torch.tanh(self.conv2(x))  # (batch, 1, 200, 179, 221)
         return x
 
-class Discriminator(nn.Module):
-    """PatchGAN-style discriminator applied per-slice (2D).
-    Takes input (B,1,D,H,W) and returns per-slice patch predictions
-    shaped (B,1,D,H_out,W_out).
-    """
-    def __init__(self, in_ch=1, ndf=64):
-        super(Discriminator, self).__init__()
-        # PatchGAN 4-layer conv net (from Pix2Pix-style)
-        self.model = nn.Sequential(
-            nn.Conv2d(in_ch, ndf, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(ndf * 2),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(ndf * 4),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(ndf * 8),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1, padding=1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # x: (batch, 1, D, H, W) → per-slice 2D
-        b, c, d, h, w = x.shape
-        x = x.squeeze(1).reshape(b * d, 1, h, w)
-        out = self.model(x)  # shape (b*d, 1, H_out, W_out)
-        out = out.reshape(b, d, 1, out.shape[2], out.shape[3]).permute(0, 2, 1, 3, 4)
-        return out
-
-
 # =====================
 # Objective Functions
 # =====================
 
-def ssim_loss(pred, target):
-    """Per-slice SSIM with independent normalization to match evaluation metric."""
+def _gaussian_kernel_2d(size=11, sigma=1.5):
+    """Create a 2D Gaussian kernel as a (1,1,size,size) PyTorch tensor."""
+    radius = size // 2
+    y = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    x = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+    kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+    return kernel.unsqueeze(0).unsqueeze(0)
+
+
+def ms_ssim_loss(pred, target, weights=None, win_size=11, sigma=1.5):
+    """Differentiable MS-SSIM matching the competition metric (per-slice, [0,1]-normalised)."""
+    if weights is None:
+        weights = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
+    n_scales = len(weights)
+
+    # (B, 1, D, H, W) → (B*D, 1, H, W)
+    b, c, d, h, w = pred.shape
+    p = pred.squeeze(1).reshape(b * d, 1, h, w)
+    t = target.squeeze(1).reshape(b * d, 1, h, w)
+
+    # Normalize each slice independently to [0, 1]
+    p_flat = p.reshape(b * d, -1)
+    t_flat = t.reshape(b * d, -1)
+    p = (p - p_flat.min(dim=1)[0].view(-1, 1, 1, 1)) / (p_flat.max(dim=1)[0].view(-1, 1, 1, 1) - p_flat.min(dim=1)[0].view(-1, 1, 1, 1) + 1e-8)
+    t = (t - t_flat.min(dim=1)[0].view(-1, 1, 1, 1)) / (t_flat.max(dim=1)[0].view(-1, 1, 1, 1) - t_flat.min(dim=1)[0].view(-1, 1, 1, 1) + 1e-8)
+
+    kernel = _gaussian_kernel_2d(win_size, sigma).to(pred.device)
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
 
-    # pred/target: (batch, 1, D, H, W) → flatten slices to (B*D, H*W)
-    b, c, d, h, w = pred.shape
-    p = pred.squeeze(1).reshape(b * d, h * w)
-    t = target.squeeze(1).reshape(b * d, h * w)
+    mcs_list = []
+    lum_last = None
+    for scale in range(n_scales):
+        if p.shape[2] < win_size or p.shape[3] < win_size:
+            break
 
-    # Normalize each slice independently to [0, 1]
-    p_min = p.min(dim=1, keepdim=True)[0]
-    p_max = p.max(dim=1, keepdim=True)[0]
-    t_min = t.min(dim=1, keepdim=True)[0]
-    t_max = t.max(dim=1, keepdim=True)[0]
-    p = (p - p_min) / (p_max - p_min + 1e-8)
-    t = (t - t_min) / (t_max - t_min + 1e-8)
+        mu1 = F.conv2d(p, kernel)
+        mu2 = F.conv2d(t, kernel)
+        mu1_sq, mu2_sq, mu1_mu2 = mu1 * mu1, mu2 * mu2, mu1 * mu2
 
-    # Per-slice SSIM
-    mu1 = p.mean(dim=1)
-    mu2 = t.mean(dim=1)
-    sigma1_sq = ((p - mu1.unsqueeze(1)) ** 2).mean(dim=1)
-    sigma2_sq = ((t - mu2.unsqueeze(1)) ** 2).mean(dim=1)
-    sigma12 = ((p - mu1.unsqueeze(1)) * (t - mu2.unsqueeze(1))).mean(dim=1)
+        sigma1_sq = torch.clamp(F.conv2d(p * p, kernel) - mu1_sq, min=0.0)
+        sigma2_sq = torch.clamp(F.conv2d(t * t, kernel) - mu2_sq, min=0.0)
+        sigma12 = F.conv2d(p * t, kernel) - mu1_mu2
 
-    ssim = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
-           ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
-    return ssim.mean()
+        luminance = (2.0 * mu1_mu2 + C1) / (mu1_sq + mu2_sq + C1)
+        cs = (2.0 * sigma12 + C2) / (sigma1_sq + sigma2_sq + C2)
 
+        mcs_list.append(cs.mean())
+        if scale == n_scales - 1:
+            lum_last = luminance.mean()
 
-def psnr_loss(pred, target):
-    """Per-slice PSNR with independent normalization to match evaluation metric."""
-    b, c, d, h, w = pred.shape
-    p = pred.squeeze(1).reshape(b * d, h * w)
-    t = target.squeeze(1).reshape(b * d, h * w)
+        # Downsample 2x (trim to even dims first)
+        if scale < n_scales - 1:
+            h_cur, w_cur = p.shape[2], p.shape[3]
+            p = F.avg_pool2d(p[:, :, :h_cur - h_cur % 2, :w_cur - w_cur % 2], 2)
+            t = F.avg_pool2d(t[:, :, :h_cur - h_cur % 2, :w_cur - w_cur % 2], 2)
 
-    # Normalize each slice independently to [0, 1]
-    p_min = p.min(dim=1, keepdim=True)[0]
-    p_max = p.max(dim=1, keepdim=True)[0]
-    t_min = t.min(dim=1, keepdim=True)[0]
-    t_max = t.max(dim=1, keepdim=True)[0]
-    p = (p - p_min) / (p_max - p_min + 1e-8)
-    t = (t - t_min) / (t_max - t_min + 1e-8)
+    n_computed = len(mcs_list)
+    if n_computed == 0:
+        return torch.tensor(0.0, device=pred.device)
 
-    mse = ((p - t) ** 2).mean(dim=1)
-    psnr = 10 * torch.log10(1.0 / (mse + 1e-8))
-    psnr = torch.clamp(psnr, 0, 50)
-    return psnr.mean()
+    # Renormalize weights to computed scales
+    used_w = weights[:n_computed]
+    w_sum = sum(used_w)
+    used_w = [ww / w_sum for ww in used_w]
+
+    ms_val = torch.tensor(1.0, device=pred.device)
+    for i, cs_val in enumerate(mcs_list):
+        cs_c = torch.clamp(cs_val, 0.0, 1.0)
+        if i == n_computed - 1 and lum_last is not None:
+            lum_c = torch.clamp(lum_last, 0.0, 1.0)
+            ms_val = ms_val * (lum_c ** used_w[i]) * (cs_c ** used_w[i])
+        else:
+            ms_val = ms_val * (cs_c ** used_w[i])
+
+    return ms_val
 
 # Loss functions
-adversarial_loss = nn.BCELoss()
-
-def generator_loss(discriminator, fake, real):
-    # Adversarial: fool discriminator into thinking fake is real
-    d_fake = discriminator(fake)
-    real_label = torch.ones_like(d_fake)
-    g_adv = adversarial_loss(d_fake, real_label)
-
-    # Competition metric: 0.5 * SSIM + 0.5 * (PSNR / 50)
-    ssim = ssim_loss(fake, real)
-    psnr = psnr_loss(fake, real)
-    competition_score = 0.5 * ssim + 0.5 * (psnr / 50)
-
-    # Maximize competition_score = minimize (1 - competition_score)
-    return g_adv + 25 * (1 - competition_score) 
-
-
-def discriminator_loss(discriminator, fake, real):
-    # Real images → label 1
-    d_real = discriminator(real)
-    real_label = torch.ones_like(d_real)
-    loss_real = adversarial_loss(d_real, real_label)
-
-    # Fake images → label 0 (detach so generator doesn't get gradients)
-    d_fake = discriminator(fake.detach())
-    fake_label = torch.zeros_like(d_fake)
-    loss_fake = adversarial_loss(d_fake, fake_label)
-
-    return (loss_real + loss_fake) / 2
+def generator_loss(fake, real):
+    ms_ssim = ms_ssim_loss(fake, real)
+    l1 = F.l1_loss(fake, real)
+    return 0.5 * l1 + 0.5 * (1 - ms_ssim)

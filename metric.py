@@ -1,15 +1,16 @@
 """
 Low-Field to High-Field MRI Enhancement Challenge - Evaluation Metric
 
-This metric evaluates predicted MRI slices against ground truth high-field images.
+This metric evaluates predicted MRI slices against ground truth high-field images
+using Multi-Scale Structural Similarity (MS-SSIM).
+
 Each row represents a single slice: row_id format is "sample_XXX_slice_YYY"
 
-The metric computes:
-- SSIM (Structural Similarity Index): Measures perceptual similarity
-- PSNR (Peak Signal-to-Noise Ratio): Measures reconstruction fidelity
+MS-SSIM evaluates structural quality across 5 resolution scales using
+Gaussian-weighted 11x11 windows (sigma=1.5) with standard weights from
+Wang, Simoncelli & Bovik (2003).
 
-Final score is a weighted combination: 0.5 * SSIM + 0.5 * (PSNR / 50)
-Higher scores are better.
+Score range: 0-1 (higher is better).
 """
 
 import pandas as pd
@@ -56,84 +57,140 @@ def base64_to_slice(b64_string: str) -> np.ndarray:
         raise ParticipantVisibleError(f"Failed to decode base64 slice: {str(e)}")
 
 
-def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
-    """
-    Compute Structural Similarity Index (SSIM) between two images.
+def _normalize_01(x: np.ndarray) -> np.ndarray:
+    """Normalize array to [0, 1] range."""
+    x_min, x_max = x.min(), x.max()
+    if x_max - x_min > 0:
+        return (x - x_min) / (x_max - x_min)
+    return np.zeros_like(x)
 
-    Args:
-        img1, img2: 2D numpy arrays (must be same shape)
+
+def _gaussian_kernel_2d(size: int = 11, sigma: float = 1.5) -> np.ndarray:
+    """Create a 2D Gaussian kernel."""
+    radius = size // 2
+    y, x = np.mgrid[-radius:radius + 1, -radius:radius + 1]
+    kernel = np.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
+    return kernel / kernel.sum()
+
+
+def _ssim_components(img1: np.ndarray, img2: np.ndarray,
+                     kernel: np.ndarray) -> tuple:
+    """
+    Compute SSIM luminance, contrast, and structure components.
 
     Returns:
-        SSIM value between 0 and 1
+        (luminance, contrast_structure) — split as in the MS-SSIM paper:
+        luminance = (2*mu1*mu2 + C1) / (mu1^2 + mu2^2 + C1)
+        cs        = (2*sigma12 + C2) / (sigma1^2 + sigma2^2 + C2)
     """
-    # Normalize to [0, 1]
-    def normalize(x):
-        x_min, x_max = x.min(), x.max()
-        if x_max - x_min > 0:
-            return (x - x_min) / (x_max - x_min)
-        return np.zeros_like(x)
+    from scipy.signal import fftconvolve
 
-    img1_norm = normalize(img1)
-    img2_norm = normalize(img2)
+    C1 = (0.01) ** 2
+    C2 = (0.03) ** 2
 
-    # SSIM constants
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
+    mu1 = fftconvolve(img1, kernel, mode='valid')
+    mu2 = fftconvolve(img2, kernel, mode='valid')
 
-    # Compute means
-    mu1 = img1_norm.mean()
-    mu2 = img2_norm.mean()
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
 
-    # Compute variances and covariance
-    sigma1_sq = ((img1_norm - mu1) ** 2).mean()
-    sigma2_sq = ((img2_norm - mu2) ** 2).mean()
-    sigma12 = ((img1_norm - mu1) * (img2_norm - mu2)).mean()
+    sigma1_sq = fftconvolve(img1 * img1, kernel, mode='valid') - mu1_sq
+    sigma2_sq = fftconvolve(img2 * img2, kernel, mode='valid') - mu2_sq
+    sigma12 = fftconvolve(img1 * img2, kernel, mode='valid') - mu1_mu2
 
-    # SSIM formula
-    numerator = (2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)
-    denominator = (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
+    # Clamp variances to avoid numerical issues
+    sigma1_sq = np.maximum(sigma1_sq, 0.0)
+    sigma2_sq = np.maximum(sigma2_sq, 0.0)
 
-    return float(numerator / denominator)
+    luminance = (2.0 * mu1_mu2 + C1) / (mu1_sq + mu2_sq + C1)
+    cs = (2.0 * sigma12 + C2) / (sigma1_sq + sigma2_sq + C2)
+
+    return luminance, cs
 
 
-def compute_psnr(img1: np.ndarray, img2: np.ndarray) -> float:
+def compute_ms_ssim(img1: np.ndarray, img2: np.ndarray,
+                    weights: list = None, win_size: int = 11,
+                    sigma: float = 1.5) -> float:
     """
-    Compute Peak Signal-to-Noise Ratio (PSNR) between two images.
+    Compute Multi-Scale SSIM between two images.
+
+    Uses 5 scales with standard weights from Wang et al. (2003).
+    At each scale, SSIM luminance/contrast/structure components are
+    computed with Gaussian-weighted local windows. Images are
+    downsampled 2x between scales using average pooling.
 
     Args:
-        img1, img2: 2D numpy arrays (must be same shape)
+        img1, img2: 2D numpy arrays (same shape), values in [0, 1]
+        weights: Per-scale weights (default: Wang et al. 2003)
+        win_size: Gaussian window size (default: 11)
+        sigma: Gaussian sigma (default: 1.5)
 
     Returns:
-        PSNR value in dB
+        MS-SSIM value between 0 and 1
     """
-    # Normalize to [0, 1]
-    def normalize(x):
-        x_min, x_max = x.min(), x.max()
-        if x_max - x_min > 0:
-            return (x - x_min) / (x_max - x_min)
-        return np.zeros_like(x)
+    if weights is None:
+        weights = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
 
-    img1_norm = normalize(img1)
-    img2_norm = normalize(img2)
+    n_scales = len(weights)
+    kernel = _gaussian_kernel_2d(win_size, sigma).astype(np.float64)
 
-    mse = ((img1_norm - img2_norm) ** 2).mean()
+    mcs_list = []
+    for scale in range(n_scales):
+        # Ensure images are large enough for this scale
+        if img1.shape[0] < win_size or img1.shape[1] < win_size:
+            # Image too small for more scales; use what we have
+            break
 
-    if mse == 0:
-        return 50.0  # Perfect match, cap at 50 dB
+        luminance, cs = _ssim_components(img1, img2, kernel)
 
-    psnr = 10 * np.log10(1.0 / mse)
+        if scale == n_scales - 1:
+            # Last scale: use full SSIM (luminance * cs)
+            mcs_list.append((luminance.mean(), cs.mean()))
+        else:
+            # Intermediate scales: only keep contrast-structure
+            mcs_list.append((None, cs.mean()))
 
-    # Clamp to [0, 50] range
-    return float(min(max(psnr, 0), 50))
+        # Downsample 2x using average pooling
+        if scale < n_scales - 1:
+            # Trim to even dimensions
+            h, w = img1.shape
+            h_even, w_even = h - h % 2, w - w % 2
+            img1 = img1[:h_even, :w_even].reshape(h_even // 2, 2, w_even // 2, 2).mean(axis=(1, 3))
+            img2 = img2[:h_even, :w_even].reshape(h_even // 2, 2, w_even // 2, 2).mean(axis=(1, 3))
+
+    # Compute MS-SSIM product
+    n_computed = len(mcs_list)
+    if n_computed == 0:
+        return 0.0
+
+    # Adjust weights to number of scales actually computed
+    used_weights = weights[:n_computed]
+    # Renormalize weights
+    w_sum = sum(used_weights)
+    used_weights = [w / w_sum for w in used_weights]
+
+    ms_ssim = 1.0
+    for i, (lum, cs_val) in enumerate(mcs_list):
+        # Clamp cs to [0, 1] for stability
+        cs_clamped = max(min(cs_val, 1.0), 0.0)
+        if i == n_computed - 1 and lum is not None:
+            # Last scale: luminance^weight * cs^weight
+            lum_clamped = max(min(lum, 1.0), 0.0)
+            ms_ssim *= (lum_clamped ** used_weights[i]) * (cs_clamped ** used_weights[i])
+        else:
+            ms_ssim *= cs_clamped ** used_weights[i]
+
+    return float(ms_ssim)
 
 
 def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: str) -> float:
     """
-    Evaluate MRI super-resolution predictions using SSIM and PSNR.
+    Evaluate MRI super-resolution predictions using MS-SSIM.
 
     Each row represents a single slice with format: row_id = "sample_XXX_slice_YYY"
 
-    Final score = 0.5 * mean_SSIM + 0.5 * (mean_PSNR / 50)
+    Final score = mean MS-SSIM across all evaluated slices.
 
     Higher scores are better. Maximum possible score is 1.0 (perfect prediction).
 
@@ -143,7 +200,7 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
         row_id_column_name: Name of the ID column (row_id)
 
     Returns:
-        Combined score between 0 and 1
+        MS-SSIM score between 0 and 1
     """
 
     # ========================================
@@ -224,11 +281,10 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
         )
 
     # ========================================
-    # COMPUTE METRICS
+    # COMPUTE MS-SSIM
     # ========================================
 
-    all_ssim = []
-    all_psnr = []
+    all_ms_ssim = []
 
     for idx, row in merged.iterrows():
         row_id = row[row_id_column_name]
@@ -272,25 +328,22 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
                 f"All pixel values must be finite numbers."
             )
 
-        # Compute metrics
-        ssim = compute_ssim(gt_slice, pred_slice)
-        psnr = compute_psnr(gt_slice, pred_slice)
+        # Normalize both to [0, 1]
+        gt_norm = _normalize_01(gt_slice).astype(np.float64)
+        pred_norm = _normalize_01(pred_slice).astype(np.float64)
 
-        all_ssim.append(ssim)
-        all_psnr.append(psnr)
+        # Compute MS-SSIM
+        ms_ssim = compute_ms_ssim(gt_norm, pred_norm)
+        all_ms_ssim.append(ms_ssim)
 
     # ========================================
     # COMPUTE FINAL SCORE
     # ========================================
 
-    mean_ssim = np.mean(all_ssim)
-    mean_psnr = np.mean(all_psnr)
-
-    # Combined score: 0.5 * SSIM + 0.5 * (PSNR / 50)
-    final_score = 0.5 * mean_ssim + 0.5 * (mean_psnr / 50)
+    final_score = float(np.mean(all_ms_ssim))
 
     # Ensure score is finite
     if not np.isfinite(final_score):
         raise ParticipantVisibleError("Computed score is not finite. Please check your predictions.")
 
-    return float(final_score)
+    return final_score

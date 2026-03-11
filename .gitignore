@@ -2,3 +2,6 @@
 /train
 *.nii
 *.nii.gz
+*.csv
+*.png
+*.pyc
